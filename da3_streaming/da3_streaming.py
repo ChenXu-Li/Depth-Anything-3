@@ -211,7 +211,10 @@ class DA3_Streaming:
 
         chunk_start, chunk_end = self.chunk_indices[chunk_idx]
 
-        if chunk_idx == 0:
+        if len(self.chunk_indices) == 1:
+            # Only one chunk, save all frames
+            save_indices = list(range(0, chunk_end - chunk_start))
+        elif chunk_idx == 0:
             save_indices = list(range(0, chunk_end - chunk_start - self.overlap_e))
         elif chunk_idx == len(self.chunk_indices) - 1:
             save_indices = list(range(self.overlap_s, chunk_end - chunk_start))
@@ -625,6 +628,34 @@ class DA3_Streaming:
 
         print("Apply alignment")
         self.sim3_list = accumulate_sim3_transforms(self.sim3_list)
+        
+        # Handle the first chunk (always save it)
+        chunk_data_first = np.load(
+            os.path.join(self.result_unaligned_dir, "chunk_0.npy"), allow_pickle=True
+        ).item()
+        np.save(os.path.join(self.result_aligned_dir, "chunk_0.npy"), chunk_data_first)
+        points_first = depth_to_point_cloud_vectorized(
+            chunk_data_first.depth,
+            chunk_data_first.intrinsics,
+            chunk_data_first.extrinsics,
+        )
+        colors_first = chunk_data_first.processed_images
+        confs_first = chunk_data_first.conf
+        ply_path_first = os.path.join(self.pcd_dir, "0_pcd.ply")
+        save_confident_pointcloud_batch(
+            points=points_first,  # shape: (H, W, 3)
+            colors=colors_first,  # shape: (H, W, 3)
+            confs=confs_first,  # shape: (H, W)
+            output_path=ply_path_first,
+            conf_threshold=np.mean(confs_first)
+            * self.config["Model"]["Pointcloud_Save"]["conf_threshold_coef"],
+            sample_ratio=self.config["Model"]["Pointcloud_Save"]["sample_ratio"],
+        )
+        if self.config["Model"]["save_depth_conf_result"]:
+            predictions = chunk_data_first
+            self.save_depth_conf_result(predictions, 0, 1, np.eye(3), np.array([0, 0, 0]))
+        
+        # Handle remaining chunks (if any)
         for chunk_idx in range(len(self.chunk_indices) - 1):
             print(f"Applying {chunk_idx+1} -> {chunk_idx} (Total {len(self.chunk_indices)-1})")
             s, R, t = self.sim3_list[chunk_idx]
@@ -648,32 +679,6 @@ class DA3_Streaming:
 
             aligned_path = os.path.join(self.result_aligned_dir, f"chunk_{chunk_idx+1}.npy")
             np.save(aligned_path, aligned_chunk_data)
-
-            if chunk_idx == 0:
-                chunk_data_first = np.load(
-                    os.path.join(self.result_unaligned_dir, "chunk_0.npy"), allow_pickle=True
-                ).item()
-                np.save(os.path.join(self.result_aligned_dir, "chunk_0.npy"), chunk_data_first)
-                points_first = depth_to_point_cloud_vectorized(
-                    chunk_data_first.depth,
-                    chunk_data_first.intrinsics,
-                    chunk_data_first.extrinsics,
-                )
-                colors_first = chunk_data_first.processed_images
-                confs_first = chunk_data_first.conf
-                ply_path_first = os.path.join(self.pcd_dir, "0_pcd.ply")
-                save_confident_pointcloud_batch(
-                    points=points_first,  # shape: (H, W, 3)
-                    colors=colors_first,  # shape: (H, W, 3)
-                    confs=confs_first,  # shape: (H, W)
-                    output_path=ply_path_first,
-                    conf_threshold=np.mean(confs_first)
-                    * self.config["Model"]["Pointcloud_Save"]["conf_threshold_coef"],
-                    sample_ratio=self.config["Model"]["Pointcloud_Save"]["sample_ratio"],
-                )
-                if self.config["Model"]["save_depth_conf_result"]:
-                    predictions = chunk_data_first
-                    self.save_depth_conf_result(predictions, 0, 1, np.eye(3), np.array([0, 0, 0]))
 
             points = aligned_chunk_data["world_points"].reshape(-1, 3)
             colors = (aligned_chunk_data["images"].reshape(-1, 3)).astype(np.uint8)
@@ -737,9 +742,15 @@ class DA3_Streaming:
         first_chunk_range, first_chunk_extrinsics = self.all_camera_poses[0]
         _, first_chunk_intrinsics = self.all_camera_intrinsics[0]
 
-        for i, idx in enumerate(
-            range(first_chunk_range[0], first_chunk_range[1] - self.overlap_e)
-        ):
+        # For the first chunk, if it's the only chunk, use all frames
+        # Otherwise, exclude the overlap_e frames
+        first_chunk_end = (
+            first_chunk_range[1] 
+            if len(self.all_camera_poses) == 1 
+            else first_chunk_range[1] - self.overlap_e
+        )
+
+        for i, idx in enumerate(range(first_chunk_range[0], first_chunk_end)):
             w2c = np.eye(4)
             w2c[:3, :] = first_chunk_extrinsics[i]
             c2w = np.linalg.inv(w2c)
@@ -777,19 +788,28 @@ class DA3_Streaming:
         poses_path = os.path.join(self.output_dir, "camera_poses.txt")
         with open(poses_path, "w") as f:
             for pose in all_poses:
-                flat_pose = pose.flatten()
-                f.write(" ".join([str(x) for x in flat_pose]) + "\n")
+                if pose is not None:
+                    flat_pose = pose.flatten()
+                    f.write(" ".join([str(x) for x in flat_pose]) + "\n")
+                else:
+                    # If pose is None, write identity matrix
+                    identity = np.eye(4).flatten()
+                    f.write(" ".join([str(x) for x in identity]) + "\n")
 
         print(f"Camera poses saved to {poses_path}")
 
         intrinsics_path = os.path.join(self.output_dir, "intrinsic.txt")
         with open(intrinsics_path, "w") as f:
             for intrinsic in all_intrinsics:
-                fx = intrinsic[0, 0]
-                fy = intrinsic[1, 1]
-                cx = intrinsic[0, 2]
-                cy = intrinsic[1, 2]
-                f.write(f"{fx} {fy} {cx} {cy}\n")
+                if intrinsic is not None:
+                    fx = intrinsic[0, 0]
+                    fy = intrinsic[1, 1]
+                    cx = intrinsic[0, 2]
+                    cy = intrinsic[1, 2]
+                    f.write(f"{fx} {fy} {cx} {cy}\n")
+                else:
+                    # If intrinsic is None, write default values
+                    f.write("0.0 0.0 0.0 0.0\n")
 
         print(f"Camera intrinsics saved to {intrinsics_path}")
 
@@ -809,10 +829,14 @@ class DA3_Streaming:
 
             color = chunk_colors[0]
             for pose in all_poses:
-                position = pose[:3, 3]
-                f.write(
-                    f"{position[0]} {position[1]} {position[2]} {color[0]} {color[1]} {color[2]}\n"
-                )
+                if pose is not None:
+                    position = pose[:3, 3]
+                    f.write(
+                        f"{position[0]} {position[1]} {position[2]} {color[0]} {color[1]} {color[2]}\n"
+                    )
+                else:
+                    # If pose is None, write origin
+                    f.write(f"0.0 0.0 0.0 {color[0]} {color[1]} {color[2]}\n")
 
         print(f"Camera poses visualization saved to {ply_path}")
 
