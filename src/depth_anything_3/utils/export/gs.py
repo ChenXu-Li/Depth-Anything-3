@@ -36,6 +36,7 @@ def export_to_gs_ply(
     gs_views_interval: Optional[
         int
     ] = 1,  # export GS every N views, useful for extremely dense inputs
+    sky_mask: Optional[torch.Tensor] = None,  # sky mask with shape (v, h, w), True indicates sky regions
 ):
     gs_world = prediction.gaussians
     pred_depth = torch.from_numpy(prediction.depth).unsqueeze(-1).to(gs_world.means)  # v h w 1
@@ -44,6 +45,11 @@ def export_to_gs_ply(
     save_path = os.path.join(export_dir, f"gs_ply/{idx:04d}.ply")
     if gs_views_interval is None:  # select around 12 views in total
         gs_views_interval = max(pred_depth.shape[0] // 12, 1)
+    
+    # Convert sky_mask to the same device as pred_depth if provided
+    if sky_mask is not None:
+        sky_mask = sky_mask.to(pred_depth.device)
+    
     save_gaussian_ply(
         gaussians=gs_world,
         save_path=save_path,
@@ -55,6 +61,7 @@ def export_to_gs_ply(
         prune_by_depth_percent=0.9,
         prune_border_gs=True,
         match_3dgs_mcmc_dev=False,
+        sky_mask=sky_mask,
     )
 
 

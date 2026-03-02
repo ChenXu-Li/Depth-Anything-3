@@ -1,0 +1,285 @@
+import os
+import numpy as np
+from pathlib import Path
+from depth_anything_3.api import DepthAnything3
+import glob
+from PIL import Image
+import pycolmap
+
+
+def load_rig_colmap_data_with_skip(
+    colmap_dir: str, 
+    sparse_subdir: str = "0",
+    skip_step: int = 1  # 跳过步长：1=使用所有图片，2=每隔1张取1张，依此类推
+) -> tuple[list[str], np.ndarray, np.ndarray]:
+    """
+    从Rig COLMAP目录加载图片路径和相机参数，并按步长跳过图片
+    支持Rig格式的COLMAP数据（包含rigs.bin和frames.bin）
+    
+    Args:
+        colmap_dir: COLMAP根目录（包含images/和sparse/子目录）
+        sparse_subdir: COLMAP稀疏重建子目录（如"0"对应sparse/0/）
+        skip_step: 图片采样步长，1=全部使用，n=每n张取1张
+    
+    Returns:
+        image_paths: 采样后的图片路径列表
+        extrinsics: 对应采样图片的外参矩阵 (N, 4, 4) - world to camera transformation
+        intrinsics: 对应采样图片的内参矩阵 (N, 3, 3)
+    """
+    colmap_dir = Path(colmap_dir)
+    images_dir = colmap_dir / "images"
+    sparse_dir = colmap_dir / "sparse" / sparse_subdir
+    
+    if not images_dir.exists():
+        raise ValueError(f"Images directory not found: {images_dir}")
+    if not sparse_dir.exists():
+        raise ValueError(f"Sparse reconstruction directory not found: {sparse_dir}")
+    
+    # 检查是否为rig格式（存在rigs.bin和frames.bin）
+    has_rigs = (sparse_dir / "rigs.bin").exists()
+    has_frames = (sparse_dir / "frames.bin").exists()
+    is_rig_format = has_rigs and has_frames
+    
+    if is_rig_format:
+        print(f"检测到Rig COLMAP格式（包含rigs.bin和frames.bin）")
+    else:
+        print(f"警告：未检测到rig格式文件，将按标准COLMAP格式处理")
+    
+    # 加载COLMAP重建
+    try:
+        recon = pycolmap.Reconstruction(str(sparse_dir))
+    except Exception as e:
+        raise RuntimeError(f"Failed to load COLMAP reconstruction from {sparse_dir}: {e}")
+    
+    # 收集图像数据
+    image_paths = []
+    extrinsics_list = []
+    intrinsics_list = []
+    
+    # 按图像ID排序以确保顺序一致
+    sorted_images = sorted(recon.images.items(), key=lambda x: x[0])
+    
+    for image_id, image in sorted_images:
+        # 获取图像路径
+        image_name = image.name
+        # 处理rig格式中的嵌套路径（如 images/pano_camera0/xxx.jpg）
+        if '/' in image_name:
+            # 如果路径中包含子目录，直接使用
+            image_path = images_dir / image_name
+        else:
+            # 否则直接使用文件名
+            image_path = images_dir / image_name
+        
+        if not image_path.exists():
+            print(f"Warning: Image file not found: {image_path}, skipping...")
+            continue
+        
+        image_paths.append(str(image_path.absolute()))
+        
+        # 获取相机
+        camera = recon.cameras[image.camera_id]
+        
+        # 提取外参（world to camera transformation）
+        # pycolmap的cam_from_world()方法应该已经能够处理rig格式
+        # 它会自动从frame中获取rig_from_world，然后结合cam_from_rig计算cam_from_world
+        try:
+            # pycolmap的image.cam_from_world()方法应该已经处理了rig格式
+            # 它会自动从frame获取rig_from_world，然后结合rig中的cam_from_rig计算
+            cam_from_world = image.cam_from_world()
+        except Exception as e:
+            # 如果直接调用失败，输出错误信息
+            print(f"Warning: Failed to get cam_from_world for image {image_id} ({image_name}): {e}")
+            print(f"  This might be due to rig format handling. Trying alternative method...")
+            
+            # 尝试备用方法：如果image有frame_id，尝试从frame获取
+            if is_rig_format and hasattr(image, 'frame_id') and image.frame_id is not None:
+                try:
+                    # 尝试通过frame获取
+                    if hasattr(recon, 'frame'):
+                        frame = recon.frame(image.frame_id)
+                        rig_from_world = frame.rig_from_world
+                        # 对于rig格式，如果无法获取cam_from_rig，假设是trivial rig
+                        # 即 cam_from_rig = identity，所以 cam_from_world = rig_from_world
+                        cam_from_world = rig_from_world
+                        print(f"  Using rig_from_world as fallback for image {image_id}")
+                    else:
+                        raise RuntimeError(f"Cannot access frames from reconstruction")
+                except Exception as inner_e:
+                    raise RuntimeError(f"Cannot get cam_from_world for image {image_id}: {e}, fallback also failed: {inner_e}")
+            else:
+                raise RuntimeError(f"Cannot get cam_from_world for image {image_id}: {e}")
+        
+        R = cam_from_world.rotation.matrix()  # (3, 3) rotation matrix
+        t = cam_from_world.translation  # (3,) translation vector
+        
+        # 构建4x4外参矩阵（world to camera）
+        extrinsic = np.eye(4, dtype=np.float32)
+        extrinsic[:3, :3] = R
+        extrinsic[:3, 3] = t
+        extrinsics_list.append(extrinsic)
+        
+        # 提取内参
+        intrinsic = np.eye(3, dtype=np.float32)
+        
+        if camera.model == pycolmap.CameraModelId.PINHOLE:
+            # PINHOLE: [fx, fy, cx, cy]
+            if len(camera.params) >= 4:
+                fx, fy, cx, cy = camera.params[:4]
+                intrinsic[0, 0] = fx
+                intrinsic[1, 1] = fy
+                intrinsic[0, 2] = cx
+                intrinsic[1, 2] = cy
+            elif len(camera.params) >= 3:
+                # SIMPLE_PINHOLE: [f, cx, cy]
+                f, cx, cy = camera.params[:3]
+                intrinsic[0, 0] = f
+                intrinsic[1, 1] = f
+                intrinsic[0, 2] = cx
+                intrinsic[1, 2] = cy
+        elif camera.model == pycolmap.CameraModelId.SIMPLE_PINHOLE:
+            # SIMPLE_PINHOLE: [f, cx, cy]
+            if len(camera.params) >= 3:
+                f, cx, cy = camera.params[:3]
+                intrinsic[0, 0] = f
+                intrinsic[1, 1] = f
+                intrinsic[0, 2] = cx
+                intrinsic[1, 2] = cy
+        else:
+            # 对于其他相机模型，尝试提取焦距和主点
+            try:
+                if len(camera.params) >= 1:
+                    f = camera.params[0]
+                    intrinsic[0, 0] = f
+                    intrinsic[1, 1] = f
+                if len(camera.params) >= 3:
+                    cx = camera.params[-2] if len(camera.params) >= 4 else camera.params[1]
+                    cy = camera.params[-1] if len(camera.params) >= 4 else camera.params[2]
+                    intrinsic[0, 2] = cx
+                    intrinsic[1, 2] = cy
+                else:
+                    # 使用图像中心作为主点
+                    intrinsic[0, 2] = camera.width / 2.0
+                    intrinsic[1, 2] = camera.height / 2.0
+            except Exception as e:
+                print(f"Warning: Could not extract intrinsics for camera {camera.id}, using defaults: {e}")
+                # 回退：使用图像尺寸
+                intrinsic[0, 0] = camera.width
+                intrinsic[1, 1] = camera.width
+                intrinsic[0, 2] = camera.width / 2.0
+                intrinsic[1, 2] = camera.height / 2.0
+        
+        intrinsics_list.append(intrinsic)
+    
+    if len(image_paths) == 0:
+        raise RuntimeError("No valid images found in COLMAP reconstruction")
+    
+    # 转换为numpy数组
+    full_extrinsics = np.array(extrinsics_list, dtype=np.float32)  # (N, 4, 4)
+    full_intrinsics = np.array(intrinsics_list, dtype=np.float32)  # (N, 3, 3)
+    
+    # 按步长采样（确保至少保留1张图片）
+    if skip_step < 1:
+        raise ValueError("skip_step必须≥1（1表示使用所有图片）")
+    
+    # 采样索引：0, skip_step, 2*skip_step...
+    sample_indices = list(range(0, len(image_paths), skip_step))
+    if not sample_indices:  # 极端情况保护
+        sample_indices = [0]
+    
+    # 提取采样后的数据集
+    sampled_image_paths = [image_paths[i] for i in sample_indices]
+    sampled_extrinsics = full_extrinsics[sample_indices]
+    sampled_intrinsics = full_intrinsics[sample_indices]
+    
+    print(f"Rig COLMAP数据加载完成：")
+    print(f"  原始图片数量: {len(image_paths)}")
+    print(f"  采样后图片数量: {len(sampled_image_paths)} (步长={skip_step})")
+    
+    return sampled_image_paths, sampled_extrinsics, sampled_intrinsics
+
+def run_rig_colmap_inference_with_skip(
+    colmap_dir: str,
+    skip_step: int = 1,
+    model_name: str = "depth-anything/DA3NESTED-GIANT-LARGE-1.1",
+    export_dir: str = "./rig_colmap_output",
+    export_format: str = "mini_npz-glb",
+    device: str = "cuda"
+):
+    """
+    主推理函数：加载Rig COLMAP采样数据并运行DepthAnything3推理
+    支持Rig格式的COLMAP数据（包含rigs.bin和frames.bin）
+    
+    Args:
+        colmap_dir: COLMAP根目录（包含images/和sparse/子目录）
+        skip_step: 图片采样步长
+        model_name: 预训练模型名称/路径
+        export_dir: 结果导出目录
+        export_format: 导出格式（支持组合：mini_npz/glb/gs_ply等）
+        device: 运行设备（cuda/cpu）
+    """
+    # 1. 初始化模型
+    model = DepthAnything3.from_pretrained(model_name).to(device)
+    model.eval()
+    
+    # 2. 加载采样后的Rig COLMAP数据
+    image_paths, extrinsics, intrinsics = load_rig_colmap_data_with_skip(
+        colmap_dir=colmap_dir,
+        sparse_subdir="0",  # 根据实际COLMAP目录调整
+        skip_step=skip_step
+    )
+    export_kwargs = {
+        "gs_video": {
+            "trj_mode": "original",  # 使用原始相机轨迹
+            "video_quality": "high", # 可选：低/中/高，对应 low/medium/high
+        }
+    }
+    # 3. 运行推理（带姿态条件的深度估计）
+    prediction = model.inference(
+        # 输入数据（采样后的图片+相机参数）
+        image=image_paths,
+        extrinsics=extrinsics,  # COLMAP外参 (N,4,4)
+        intrinsics=intrinsics,  # COLMAP内参 (N,3,3)
+        
+        # 核心参数
+        align_to_input_ext_scale=False,  # 对齐输入外参尺度
+        use_ray_pose=False,  # 可选：启用ray-based pose提升精度（稍慢）
+        ref_view_strategy="saddle_balanced",  # 多视角参考帧选择策略
+        infer_gs=True,
+        
+        # 处理分辨率
+        process_res=504,
+        process_res_method="upper_bound_resize",
+        
+        # 导出配置
+        export_dir=export_dir,
+        export_format=export_format,
+        conf_thresh_percentile=40.0,  # GLB导出置信度阈值
+        num_max_points=30_000_000,     # GLB点云最大点数
+        show_cameras=True,            # GLB中显示相机位姿
+        export_kwargs=export_kwargs,
+    )
+    
+    # 4. 输出结果信息
+    print(f"\n推理完成！结果导出至: {export_dir}")
+    print(f"  深度图形状: {prediction.depth.shape}")
+    print(f"  相机外参形状: {prediction.extrinsics.shape}")
+    print(f"  相机内参形状: {prediction.intrinsics.shape}")
+    
+    return prediction
+
+# -------------------------- 示例调用 --------------------------
+if __name__ == "__main__":
+    # 示例1：使用所有图片（skip_step=1）
+    # run_rig_colmap_inference_with_skip(
+    #     colmap_dir="./path/to/rig_colmap_data",
+    #     skip_step=1,
+    #     export_dir="./output_all"
+    # )
+    
+    # 示例2：从innovation32 rig colmap数据加载，每10张图片取1张（skip_step=10）
+    run_rig_colmap_inference_with_skip(
+        colmap_dir="/root/autodl-tmp/data/colmap_360Roam_4x/bar16",
+        skip_step=15,
+        export_dir="/root/autodl-tmp/results/rigcolmap/bar16_output_skip15",
+        export_format="mini_npz-glb-gs_ply-gs_video-gs_depth"
+    )
