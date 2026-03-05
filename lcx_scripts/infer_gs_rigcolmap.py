@@ -375,14 +375,14 @@ if __name__ == "__main__":
     # 示例2：从innovation32 rig colmap数据加载，每25张图片取1张（skip_step=25）
     # 硬编码的视角选择列表（参考extract_images.py）
     # 列表A：图片索引（排序后的第几张，从0开始）
-    A = [1,7,10]  # 示例：提取第0、1、2、3张图片(等价为第i个全景图)
+    A = [0,2,4]  # 示例：提取第0、1、2、3张图片(等价为第i个全景图)
     
     # 列表B：相机索引（pano_camera编号）
     B = [12, 15, 19, 22]  # 示例：从这些相机目录提取
 
     # 列表C：用于全景深度导出的视角索引（等价于 Prediction 中的视图索引）
     # 这些索引应对应于推理结果中的视图顺序（即 depth / extrinsics / intrinsics 的第 Ci 帧）。
-    C = [1,2,7]  # 示例：从这些视图位置生成全景深度 cubemap
+    C = [0,1,2,15]  # 示例：从这些视图位置生成全景深度 cubemap
 
     # 为 gs_pandepth 导出方式增加配置
     # 注意：这里直接修改 export_format，增加 "gs_pandepth" 选项
@@ -392,7 +392,7 @@ if __name__ == "__main__":
     run_rig_colmap_inference_with_skip(
         colmap_dir="/root/autodl-tmp/data/colmap_360Roam_4x/bar16",
         skip_step=1,
-        export_dir="/root/autodl-tmp/results/rigcolmap/bar16_noalign_pan",
+        export_dir=f"/root/autodl-tmp/results/rigcolmap/bar16_{len(A)}p{len(B)}v",
         export_format=export_format,
         image_indices=A,  # 使用硬编码的图片索引列表
         camera_indices=B,  # 使用硬编码的相机索引列表
